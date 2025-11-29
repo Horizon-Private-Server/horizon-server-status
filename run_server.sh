@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME="echo-probe:latest"
+IMAGE_NAME="horizon-status-server"
 
 # Build image
 docker build -t "${IMAGE_NAME}" .
@@ -20,7 +20,7 @@ echo "Starting Horizon Metrics Echo Server..."
 echo "  TCP = ${TCP_PORT}"
 echo "  UDP = ${UDP_PORT}"
 
-docker run --rm -d --name horizon-status \
+docker run --rm -d --name horizon-status-server \
   -p "${TCP_PORT}:${TCP_PORT}/tcp" \
   -p "${UDP_PORT}:${UDP_PORT}/udp" \
   "${IMAGE_NAME}" \

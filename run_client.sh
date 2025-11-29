@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME="echo-probe:latest"
+IMAGE_NAME="horizon-status-client"
 
 # Build image
 docker build -t "${IMAGE_NAME}" .
@@ -32,7 +32,7 @@ echo "  TCP_PORT   = ${TCP_PORT}"
 echo "  UDP_PORT   = ${UDP_PORT}"
 echo "  DELAY_MS   = ${DELAY_MS}"
 
-docker run --rm -d --name horizon-status \
+docker run --rm -d --name horizon-status-client \
   --network host \
   -e "HORIZON_STATUS_DISCORD_TOKEN=${DISCORD_TOKEN}" \
   -e "HORIZON_STATUS_CHANNEL_ID=${DISCORD_CHANNEL_ID}" \
