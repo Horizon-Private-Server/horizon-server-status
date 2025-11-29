@@ -21,7 +21,8 @@ echo "  TCP = ${TCP_PORT}"
 echo "  UDP = ${UDP_PORT}"
 
 docker run --rm \
-  --network host \
+  -p "${TCP_PORT}:${TCP_PORT}/tcp" \
+  -p "${UDP_PORT}:${UDP_PORT}/udp" \
   "${IMAGE_NAME}" \
   server \
     --tcp-port "${TCP_PORT}" \

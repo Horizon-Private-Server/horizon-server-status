@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import json
+import os
 import struct
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
 # Message format:
 # For UDP:
@@ -10,6 +16,146 @@ from datetime import datetime, timezone
 #
 # For TCP:
 #   [2-byte big-endian msg_len][rest as above]
+
+
+DISCORD_API_BASE = "https://discord.com/api/v10"
+USER_AGENT = "HorizonMetricsBot/1.0 (+https://horizon)"
+
+
+@dataclass
+class RttStats:
+    tcp_ms: Optional[int] = None
+    udp_ms: Optional[int] = None
+    updated_at: Optional[datetime] = None
+    tcp_history: List[Tuple[int, int]] = None
+    udp_history: List[Tuple[int, int]] = None
+
+    def __post_init__(self):
+        self.tcp_history = []
+        self.udp_history = []
+
+    def update_tcp(self, rtt_ms: int):
+        now = datetime.now(timezone.utc)
+        now_ts_ms = int(now.timestamp() * 1000)
+        self.tcp_ms = rtt_ms
+        self.updated_at = now
+        self._record(self.tcp_history, now_ts_ms, rtt_ms)
+
+    def update_udp(self, rtt_ms: int):
+        now = datetime.now(timezone.utc)
+        now_ts_ms = int(now.timestamp() * 1000)
+        self.udp_ms = rtt_ms
+        self.updated_at = now
+        self._record(self.udp_history, now_ts_ms, rtt_ms)
+
+    def _record(self, history: List[Tuple[int, int]], now_ts_ms: int, rtt_ms: int):
+        history.append((now_ts_ms, rtt_ms))
+        cutoff = now_ts_ms - 5 * 60 * 1000  # keep last 5 minutes
+        while history and history[0][0] < cutoff:
+            history.pop(0)
+
+    def _window_stats(self, history: List[Tuple[int, int]], now_ts_ms: int, window_ms: int):
+        cutoff = now_ts_ms - window_ms
+        values = [r for ts, r in history if ts >= cutoff]
+        if not values:
+            return None
+        return {
+            "avg": sum(values) / len(values),
+            "min": min(values),
+            "max": max(values),
+        }
+
+    def snapshot(self) -> Dict[str, Optional[str]]:
+        """Return a shallow copy suitable for rendering."""
+        now_ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        return {
+            "tcp_ms": self.tcp_ms,
+            "udp_ms": self.udp_ms,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "tcp_2m": self._window_stats(self.tcp_history, now_ts_ms, 2 * 60 * 1000),
+            "tcp_5m": self._window_stats(self.tcp_history, now_ts_ms, 5 * 60 * 1000),
+            "udp_2m": self._window_stats(self.udp_history, now_ts_ms, 2 * 60 * 1000),
+            "udp_5m": self._window_stats(self.udp_history, now_ts_ms, 5 * 60 * 1000),
+        }
+
+
+class DiscordBotClient:
+    def __init__(self, token: str, channel_id: str, message_id: Optional[str]):
+        self.token = token
+        self.channel_id = channel_id
+        self.message_id = message_id
+        self.opener = urllib.request.build_opener()
+        self.bot_user: Optional[str] = None
+
+    def _make_request(self, method: str, url: str, payload: Optional[Dict[str, str]] = None):
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", f"Bot {self.token}")
+        req.add_header("User-Agent", USER_AGENT)
+        if payload is not None:
+            req.add_header("Content-Type", "application/json")
+        with self.opener.open(req, timeout=10) as resp:
+            body = resp.read()
+            if not body:
+                return {}
+            return json.loads(body.decode("utf-8"))
+
+    async def initialize(self) -> bool:
+        """Validate token and fetch bot user info."""
+        url = f"{DISCORD_API_BASE}/users/@me"
+
+        def _init():
+            try:
+                data = self._make_request("GET", url)
+                self.bot_user = data.get("id")
+                username = data.get("username")
+                if self.bot_user:
+                    print(f"[DISCORD] Bot authenticated as {username} (id={self.bot_user})")
+                else:
+                    print("[DISCORD] Bot authentication response missing id")
+                return True
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace")
+                print(f"[DISCORD] Failed to authenticate bot: {e} body={body}")
+            except Exception as e:
+                print(f"[DISCORD] Unexpected error during Discord init: {e}")
+            return False
+
+        return await asyncio.to_thread(_init)
+
+    async def post_message(self, content: str) -> Optional[str]:
+        url = f"{DISCORD_API_BASE}/channels/{self.channel_id}/messages"
+        payload = {"content": content}
+
+        def _send():
+            try:
+                data = self._make_request("POST", url, payload)
+                return data.get("id")
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace")
+                print(f"[DISCORD] Failed to post message: {e} body={body}")
+            except Exception as e:
+                print(f"[DISCORD] Unexpected error posting message: {e}")
+            return None
+
+        return await asyncio.to_thread(_send)
+
+    async def edit_message(self, message_id: str, content: str) -> bool:
+        url = f"{DISCORD_API_BASE}/channels/{self.channel_id}/messages/{message_id}"
+        payload = {"content": content}
+
+        def _send():
+            try:
+                self._make_request("PATCH", url, payload)
+                return True
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace")
+                print(f"[DISCORD] Failed to edit message {message_id}: {e} body={body}")
+            except Exception as e:
+                print(f"[DISCORD] Unexpected error editing message {message_id}: {e}")
+            return False
+
+        return await asyncio.to_thread(_send)
 
 
 def build_payload(password: str) -> bytes:
@@ -130,9 +276,10 @@ async def run_server(tcp_port: int, udp_port: int, password: str):
 
 
 class UdpClientProtocol(asyncio.DatagramProtocol):
-    def __init__(self, password: str):
+    def __init__(self, password: str, stats: RttStats):
         self.password = password
         self.transport = None
+        self.stats = stats
 
     def connection_made(self, transport):
         self.transport = transport
@@ -144,13 +291,14 @@ class UdpClientProtocol(asyncio.DatagramProtocol):
             return
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         rtt_ms = now_ms - ts_ms
-        print(f"UDP RTT: {rtt_ms} ms")
+        #(f"UDP RTT: {rtt_ms} ms")
+        self.stats.update_udp(rtt_ms)
 
 
-async def udp_client_task(host: str, port: int, delay_ms: int, password: str):
+async def udp_client_task(host: str, port: int, delay_ms: int, password: str, stats: RttStats):
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(
-        lambda: UdpClientProtocol(password),
+        lambda: UdpClientProtocol(password, stats),
         remote_addr=(host, port),
     )
 
@@ -163,7 +311,7 @@ async def udp_client_task(host: str, port: int, delay_ms: int, password: str):
         transport.close()
 
 
-async def tcp_client_task(host: str, port: int, delay_ms: int, password: str):
+async def tcp_client_task(host: str, port: int, delay_ms: int, password: str, stats: RttStats):
     reader, writer = await asyncio.open_connection(host, port)
     addr = writer.get_extra_info("peername")
     print(f"[CLIENT] Connected to TCP server at {addr}")
@@ -193,7 +341,8 @@ async def tcp_client_task(host: str, port: int, delay_ms: int, password: str):
                     continue
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                 rtt_ms = now_ms - ts_ms
-                print(f"TCP RTT: {rtt_ms} ms")
+                #print(f"TCP RTT: {rtt_ms} ms")
+                stats.update_tcp(rtt_ms)
         except asyncio.IncompleteReadError:
             print("[CLIENT] TCP connection closed by server")
         except asyncio.CancelledError:
@@ -210,12 +359,103 @@ async def tcp_client_task(host: str, port: int, delay_ms: int, password: str):
         await writer.wait_closed()
 
 
-async def run_client(host: str, tcp_port: int, udp_port: int, delay_ms: int, password: str):
-    # Run both TCP and UDP clients concurrently
-    await asyncio.gather(
-        udp_client_task(host, udp_port, delay_ms, password),
-        tcp_client_task(host, tcp_port, delay_ms, password),
+def build_discord_content(snapshot: Dict[str, Optional[str]]) -> str:
+    tcp = snapshot["tcp_ms"]
+    udp = snapshot["udp_ms"]
+    updated = snapshot["updated_at"]
+    tcp_2m = snapshot.get("tcp_2m")
+    tcp_5m = snapshot.get("tcp_5m")
+    udp_2m = snapshot.get("udp_2m")
+    udp_5m = snapshot.get("udp_5m")
+    tcp_str = f"{tcp} ms" if tcp is not None else "n/a"
+    udp_str = f"{udp} ms" if udp is not None else "n/a"
+    if updated:
+        # Discord timestamp tags render in each user's local timezone
+        try:
+            updated_dt = datetime.fromisoformat(updated)
+            ts = int(updated_dt.timestamp())
+            updated_str = f"<t:{ts}:F> (<t:{ts}:R>)"
+        except Exception:
+            updated_str = updated
+    else:
+        updated_str = "pending"
+
+    def fmt_window(data: Optional[Dict[str, float]]) -> str:
+        if not data:
+            return "n/a"
+        return (
+            f"avg `{data['avg']:.1f} ms` · "
+            f"min `{int(data['min'])}` · "
+            f"max `{int(data['max'])}`"
+        )
+
+    return (
+        "**Server Status (ping from FourBolt's place)**\n"
+        f"**TCP**\n"
+        f"• Latest: `{tcp_str}`\n"
+        f"• 2m: {fmt_window(tcp_2m)}\n"
+        f"• 5m: {fmt_window(tcp_5m)}\n"
+        f"**UDP**\n"
+        f"• Latest: `{udp_str}`\n"
+        f"• 2m: {fmt_window(udp_2m)}\n"
+        f"• 5m: {fmt_window(udp_5m)}\n"
+        f"*Updated:* {updated_str}\n"
     )
+
+
+async def discord_status_task(
+    stats: RttStats,
+    bot: DiscordBotClient,
+    interval_seconds: int = 5,
+):
+    if not await bot.initialize():
+        print("[DISCORD] Skipping status updates due to failed bot initialization")
+        return
+
+    current_message_id = bot.message_id or None
+    while True:
+        snapshot = stats.snapshot()
+        content = build_discord_content(snapshot)
+        if current_message_id:
+            success = await bot.edit_message(current_message_id, content)
+            if not success:
+                # Try to recreate on next iteration
+                current_message_id = None
+        else:
+            new_id = await bot.post_message(content)
+            if new_id:
+                current_message_id = new_id
+                bot.message_id = new_id
+                print(f"[DISCORD] Posted status message id={new_id}")
+        await asyncio.sleep(interval_seconds)
+
+
+async def run_client(
+    host: str,
+    tcp_port: int,
+    udp_port: int,
+    delay_ms: int,
+    password: str,
+    discord_token: Optional[str],
+    discord_channel_id: Optional[str],
+    discord_message_id: Optional[str],
+):
+    stats = RttStats()
+    tasks = [
+        udp_client_task(host, udp_port, delay_ms, password, stats),
+        tcp_client_task(host, tcp_port, delay_ms, password, stats),
+    ]
+
+    if discord_token and discord_channel_id:
+        bot = DiscordBotClient(discord_token, discord_channel_id, discord_message_id)
+        tasks.append(
+            discord_status_task(stats, bot)
+        )
+    else:
+        print("[DISCORD] Skipping status updates (token or channel ID missing)")
+
+    # Run both TCP and UDP clients concurrently
+    await asyncio.gather(*tasks)
 
 
 # ----------------- ENTRY POINT -----------------
@@ -246,9 +486,22 @@ def main():
     if args.mode == "server":
         asyncio.run(run_server(args.tcp_port, args.udp_port, args.password))
     else:
-        asyncio.run(run_client(args.host, args.tcp_port, args.udp_port, args.delay_ms, args.password))
+        discord_token = os.environ.get("HORIZON_STATUS_DISCORD_TOKEN")
+        discord_channel_id = os.environ.get("HORIZON_STATUS_CHANNEL_ID")
+        discord_message_id = os.environ.get("HORIZON_STATUS_MESSAGE_ID")
+        asyncio.run(
+            run_client(
+                args.host,
+                args.tcp_port,
+                args.udp_port,
+                args.delay_ms,
+                args.password,
+                discord_token,
+                discord_channel_id,
+                discord_message_id,
+            )
+        )
 
 
 if __name__ == "__main__":
     main()
-
