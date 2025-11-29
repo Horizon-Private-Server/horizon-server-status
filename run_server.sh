@@ -20,7 +20,7 @@ echo "Starting Horizon Metrics Echo Server..."
 echo "  TCP = ${TCP_PORT}"
 echo "  UDP = ${UDP_PORT}"
 
-docker run --rm \
+docker run --rm -d --name horizon-status \
   -p "${TCP_PORT}:${TCP_PORT}/tcp" \
   -p "${UDP_PORT}:${UDP_PORT}/udp" \
   "${IMAGE_NAME}" \
