@@ -426,22 +426,39 @@ async def discord_status_task(
         return
 
     current_message_id = bot.message_id or None
+    posted_once = current_message_id is not None
+    edit_failure_logged = False
+
     while True:
         snapshot = stats.snapshot()
         content = build_discord_content(snapshot)
-        if current_message_id:
-            success = await bot.edit_message(current_message_id, content)
-            if not success:
-                # Try to recreate on next iteration
-                current_message_id = None
-        else:
+
+        if not posted_once:
             new_id = await bot.post_message(content)
             if new_id:
                 current_message_id = new_id
                 bot.message_id = new_id
+                posted_once = True
                 print(f"[DISCORD] Posted status message id={new_id}")
                 if message_id_file:
                     write_message_id_to_file(message_id_file, new_id)
+            else:
+                print("[DISCORD] Failed to post initial status message; retrying...")
+            await asyncio.sleep(interval_seconds)
+            continue
+
+        if not current_message_id:
+            print("[DISCORD] No message id available to edit; skipping update")
+            await asyncio.sleep(interval_seconds)
+            continue
+
+        success = await bot.edit_message(current_message_id, content)
+        if not success and not edit_failure_logged:
+            print("[DISCORD] Failed to edit status message; will keep retrying the same message id")
+            edit_failure_logged = True
+        if success and edit_failure_logged:
+            # Reset so we log again if future edits start failing after a recovery
+            edit_failure_logged = False
         await asyncio.sleep(interval_seconds)
 
 
