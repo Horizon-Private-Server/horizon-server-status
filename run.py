@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import struct
+import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -189,6 +190,17 @@ def parse_payload(data: bytes, expected_password: str):
         return None, None
     ts_ms = struct.unpack("!Q", ts_bytes)[0]
     return password, ts_ms
+
+
+def write_message_id_to_file(path: str, message_id: str) -> None:
+    try:
+        dir_path = os.path.dirname(path)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(message_id)
+    except Exception as e:
+        print(f"[DISCORD] Failed to persist message id to {path}: {e}")
 
 
 # ----------------- SERVER SIDE -----------------
@@ -407,6 +419,7 @@ async def discord_status_task(
     stats: RttStats,
     bot: DiscordBotClient,
     interval_seconds: int = 5,
+    message_id_file: Optional[str] = None,
 ):
     if not await bot.initialize():
         print("[DISCORD] Skipping status updates due to failed bot initialization")
@@ -427,6 +440,8 @@ async def discord_status_task(
                 current_message_id = new_id
                 bot.message_id = new_id
                 print(f"[DISCORD] Posted status message id={new_id}")
+                if message_id_file:
+                    write_message_id_to_file(message_id_file, new_id)
         await asyncio.sleep(interval_seconds)
 
 
@@ -439,6 +454,7 @@ async def run_client(
     discord_token: Optional[str],
     discord_channel_id: Optional[str],
     discord_message_id: Optional[str],
+    discord_message_id_file: Optional[str],
 ):
     stats = RttStats()
     tasks = [
@@ -449,7 +465,7 @@ async def run_client(
     if discord_token and discord_channel_id:
         bot = DiscordBotClient(discord_token, discord_channel_id, discord_message_id)
         tasks.append(
-            discord_status_task(stats, bot)
+            discord_status_task(stats, bot, message_id_file=discord_message_id_file)
         )
     else:
         print("[DISCORD] Skipping status updates (token or channel ID missing)")
@@ -489,6 +505,16 @@ def main():
         discord_token = os.environ.get("HORIZON_STATUS_DISCORD_TOKEN")
         discord_channel_id = os.environ.get("HORIZON_STATUS_CHANNEL_ID")
         discord_message_id = os.environ.get("HORIZON_STATUS_MESSAGE_ID")
+        discord_message_id_file = os.environ.get("HORIZON_STATUS_MESSAGE_ID_FILE")
+        if not discord_token:
+            print("ERROR: HORIZON_STATUS_DISCORD_TOKEN must be set for Discord updates.")
+            sys.exit(1)
+        if not (discord_message_id or discord_channel_id):
+            print("ERROR: Provide HORIZON_STATUS_MESSAGE_ID or HORIZON_STATUS_CHANNEL_ID for Discord updates.")
+            sys.exit(1)
+        if not discord_channel_id:
+            print("ERROR: HORIZON_STATUS_CHANNEL_ID must be set to target the Discord message.")
+            sys.exit(1)
         asyncio.run(
             run_client(
                 args.host,
@@ -499,6 +525,7 @@ def main():
                 discord_token,
                 discord_channel_id,
                 discord_message_id,
+                discord_message_id_file,
             )
         )
 
