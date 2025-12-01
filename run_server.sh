@@ -23,7 +23,7 @@ echo "  UDP = ${UDP_PORT}"
 # Ensure old container is removed before starting a new one
 docker rm -f horizon-status-server >/dev/null 2>&1 || true
 
-docker run --rm -d --name horizon-status-server \
+docker run --rm -it --name horizon-status-server \
   -p "${TCP_PORT}:${TCP_PORT}/tcp" \
   -p "${UDP_PORT}:${UDP_PORT}/udp" \
   "${IMAGE_NAME}" \

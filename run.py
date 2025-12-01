@@ -5,11 +5,13 @@ import json
 import os
 import struct
 import sys
+import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Message format:
 # For UDP:
@@ -21,6 +23,24 @@ from typing import Dict, List, Optional, Tuple
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 USER_AGENT = "HorizonMetricsBot/1.0 (+https://horizon)"
+
+# AWS EC2 regional endpoints (root URL, no /ping)
+# Docs: https://docs.aws.amazon.com/ec2/latest/devguide/ec2-endpoints.html
+REGION_ENDPOINTS = {
+    # US
+    "us-east-1 (N. Virginia)": "https://ec2.us-east-1.amazonaws.com",
+    "us-east-2 (Ohio)": "https://ec2.us-east-2.amazonaws.com",
+    "us-west-1 (N. California)": "https://ec2.us-west-1.amazonaws.com",
+    "us-west-2 (Oregon)": "https://ec2.us-west-2.amazonaws.com",
+    # Europe
+    "eu-west-1 (Ireland)": "https://ec2.eu-west-1.amazonaws.com",
+    "eu-central-1 (Frankfurt)": "https://ec2.eu-central-1.amazonaws.com",
+    "eu-north-1 (Stockholm)": "https://ec2.eu-north-1.amazonaws.com",
+}
+
+REGION_PING_INTERVAL_SECONDS = 5
+TCP_TIMEOUT_SECONDS = 3
+METRICS_PREFIX = b"METRICS|"
 
 
 @dataclass
@@ -51,7 +71,7 @@ class RttStats:
 
     def _record(self, history: List[Tuple[int, int]], now_ts_ms: int, rtt_ms: int):
         history.append((now_ts_ms, rtt_ms))
-        cutoff = now_ts_ms - 5 * 60 * 1000  # keep last 5 minutes
+        cutoff = now_ts_ms - 30 * 60 * 1000  # keep last 30 minutes for 30m min/max
         while history and history[0][0] < cutoff:
             history.pop(0)
 
@@ -66,6 +86,13 @@ class RttStats:
             "max": max(values),
         }
 
+    def _window_minmax(self, history: List[Tuple[int, int]], now_ts_ms: int, window_ms: int):
+        cutoff = now_ts_ms - window_ms
+        values = [r for ts, r in history if ts >= cutoff]
+        if not values:
+            return None
+        return {"min": min(values), "max": max(values)}
+
     def snapshot(self) -> Dict[str, Optional[str]]:
         """Return a shallow copy suitable for rendering."""
         now_ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -73,10 +100,80 @@ class RttStats:
             "tcp_ms": self.tcp_ms,
             "udp_ms": self.udp_ms,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-            "tcp_2m": self._window_stats(self.tcp_history, now_ts_ms, 2 * 60 * 1000),
             "tcp_5m": self._window_stats(self.tcp_history, now_ts_ms, 5 * 60 * 1000),
-            "udp_2m": self._window_stats(self.udp_history, now_ts_ms, 2 * 60 * 1000),
+            "tcp_30m": self._window_minmax(self.tcp_history, now_ts_ms, 30 * 60 * 1000),
             "udp_5m": self._window_stats(self.udp_history, now_ts_ms, 5 * 60 * 1000),
+            "udp_30m": self._window_minmax(self.udp_history, now_ts_ms, 30 * 60 * 1000),
+        }
+
+
+class RegionLatencyState:
+    """Stores the latest server-side AWS latency results plus short-term windows."""
+
+    def __init__(self):
+        self.latest_raw: Optional[Dict[str, Any]] = None
+        # region -> list of (ts_ms, tcp_ms)
+        self.history: Dict[str, List[Tuple[int, Optional[float]]]] = {}
+
+    def _prune(self, history: List[Tuple[int, Optional[float]]], now_ms: int):
+        cutoff = now_ms - 30 * 60 * 1000  # keep last 30 minutes
+        while history and history[0][0] < cutoff:
+            history.pop(0)
+
+    def _window_stats(self, values: List[float]) -> Optional[Dict[str, float]]:
+        if not values:
+            return None
+        return {
+            "avg": sum(values) / len(values),
+            "min": min(values),
+            "max": max(values),
+        }
+
+    def _window_minmax(self, values: List[float]) -> Optional[Dict[str, float]]:
+        if not values:
+            return None
+        return {"min": min(values), "max": max(values)}
+
+    def update(self, payload: Dict[str, Any]) -> None:
+        ts_ms = payload.get("timestamp_ms") or int(time.time() * 1000)
+        self.latest_raw = payload
+        for entry in payload.get("regions", []):
+            region = entry.get("region", "unknown")
+            tcp_ms = entry.get("tcp_ms")
+            hist = self.history.setdefault(region, [])
+            hist.append((ts_ms, tcp_ms))
+            self._prune(hist, ts_ms)
+
+    def snapshot(self) -> Optional[Dict[str, Any]]:
+        if self.latest_raw is None:
+            return None
+
+        now_ms = int(time.time() * 1000)
+        latest_ts = self.latest_raw.get("timestamp_ms")
+        latest_regions = {r.get("region", "unknown"): r for r in self.latest_raw.get("regions", [])}
+        all_regions: List[str] = list(latest_regions.keys())
+        for region in self.history.keys():
+            if region not in latest_regions:
+                all_regions.append(region)
+
+        regions_snapshot: List[Dict[str, Any]] = []
+        for region in all_regions:
+            hist = self.history.get(region, [])
+            self._prune(hist, now_ms)
+            tcp_vals_5m = [v for ts, v in hist if ts >= now_ms - 5 * 60 * 1000 and v is not None]
+            tcp_vals_30m = [v for ts, v in hist if ts >= now_ms - 30 * 60 * 1000 and v is not None]
+
+            latest_entry = latest_regions.get(region, {})
+            regions_snapshot.append({
+                "region": region,
+                "tcp_ms": latest_entry.get("tcp_ms"),
+                "tcp_5m": self._window_stats(tcp_vals_5m),
+                "tcp_30m": self._window_minmax(tcp_vals_30m),
+            })
+
+        return {
+            "timestamp_ms": latest_ts,
+            "regions": regions_snapshot,
         }
 
 
@@ -192,18 +289,75 @@ def parse_payload(data: bytes, expected_password: str):
     return password, ts_ms
 
 
-def write_message_id_to_file(path: str, message_id: str) -> None:
-    try:
-        dir_path = os.path.dirname(path)
-        if dir_path:
-            os.makedirs(dir_path, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(message_id)
-    except Exception as e:
-        print(f"[DISCORD] Failed to persist message id to {path}: {e}")
-
-
 # ----------------- SERVER SIDE -----------------
+
+
+class RegionMetricsCache:
+    """Stores the most recent AWS latency frame to piggyback on TCP echoes."""
+
+    def __init__(self):
+        self.latest_frame: Optional[bytes] = None
+
+    def update(self, frame: bytes) -> None:
+        self.latest_frame = frame
+
+    def get(self) -> Optional[bytes]:
+        return self.latest_frame
+
+
+async def measure_tcp_latency(host: str, port: int = 443) -> Optional[float]:
+    start = time.perf_counter()
+    try:
+        conn = asyncio.open_connection(host, port)
+        _, writer = await asyncio.wait_for(conn, timeout=TCP_TIMEOUT_SECONDS)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        writer.close()
+        await writer.wait_closed()
+        return elapsed_ms
+    except Exception:
+        return None
+
+
+async def measure_region_latency(region: str, url: str) -> Dict[str, Any]:
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if host is None:
+        return {"region": region, "tcp_ms": None}
+
+    tcp_ms = await measure_tcp_latency(host)
+    return {"region": region, "tcp_ms": tcp_ms}
+
+
+async def collect_region_latencies() -> Dict[str, Any]:
+    tasks = [
+        measure_region_latency(region, url)
+        for region, url in REGION_ENDPOINTS.items()
+    ]
+    results = await asyncio.gather(*tasks)
+    return {
+        "type": "region_latency",
+        "timestamp_ms": int(time.time() * 1000),
+        "regions": results,
+    }
+
+
+def build_region_metrics_message(payload: Dict[str, Any]) -> bytes:
+    body = METRICS_PREFIX + json.dumps(payload).encode("utf-8")
+    if len(body) > 65535:
+        raise ValueError("Region metrics payload too large to frame")
+    header = struct.pack("!H", len(body))
+    return header + body
+
+
+async def region_latency_loop(cache: RegionMetricsCache) -> None:
+    while True:
+        try:
+            payload = await collect_region_latencies()
+            framed = build_region_metrics_message(payload)
+            cache.update(framed)
+        except Exception as e:
+            print(f"[SERVER] Region latency loop error: {e}")
+        await asyncio.sleep(REGION_PING_INTERVAL_SECONDS)
 
 
 class UdpServerProtocol(asyncio.DatagramProtocol):
@@ -227,7 +381,8 @@ class UdpServerProtocol(asyncio.DatagramProtocol):
 
 async def handle_tcp_client(reader: asyncio.StreamReader,
                             writer: asyncio.StreamWriter,
-                            password: str):
+                            password: str,
+                            metrics_cache: RegionMetricsCache):
     addr = writer.get_extra_info("peername")
     print(f"[SERVER] TCP client connected: {addr}")
     try:
@@ -242,8 +397,11 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
                 writer.close()
                 await writer.wait_closed()
                 return
-            # Echo back the same frame
+            # Echo back the same frame, plus piggyback latest region metrics if available
             writer.write(header + body)
+            latest_metrics = metrics_cache.get()
+            if latest_metrics:
+                writer.write(latest_metrics)
             await writer.drain()
     except asyncio.IncompleteReadError:
         # Client closed connection
@@ -260,6 +418,8 @@ async def handle_tcp_client(reader: asyncio.StreamReader,
 
 
 async def run_server(tcp_port: int, udp_port: int, password: str):
+    metrics_cache = RegionMetricsCache()
+
     loop = asyncio.get_running_loop()
 
     # UDP server
@@ -270,17 +430,24 @@ async def run_server(tcp_port: int, udp_port: int, password: str):
 
     # TCP server
     tcp_server = await asyncio.start_server(
-        lambda r, w: handle_tcp_client(r, w, password),
+        lambda r, w: handle_tcp_client(r, w, password, metrics_cache),
         host="0.0.0.0",
         port=tcp_port,
     )
     addrs = ", ".join(str(sock.getsockname()) for sock in tcp_server.sockets)
     print(f"[SERVER] TCP listening on {addrs}")
 
+    region_task = asyncio.create_task(region_latency_loop(metrics_cache))
+
     async with tcp_server:
         try:
             await tcp_server.serve_forever()
         finally:
+            region_task.cancel()
+            try:
+                await region_task
+            except asyncio.CancelledError:
+                pass
             udp_transport.close()
 
 
@@ -323,7 +490,14 @@ async def udp_client_task(host: str, port: int, delay_ms: int, password: str, st
         transport.close()
 
 
-async def tcp_client_task(host: str, port: int, delay_ms: int, password: str, stats: RttStats):
+async def tcp_client_task(
+    host: str,
+    port: int,
+    delay_ms: int,
+    password: str,
+    stats: RttStats,
+    region_metrics: RegionLatencyState,
+):
     reader, writer = await asyncio.open_connection(host, port)
     addr = writer.get_extra_info("peername")
     print(f"[CLIENT] Connected to TCP server at {addr}")
@@ -348,6 +522,14 @@ async def tcp_client_task(host: str, port: int, delay_ms: int, password: str, st
                 header = await reader.readexactly(2)
                 (msg_len,) = struct.unpack("!H", header)
                 body = await reader.readexactly(msg_len)
+                if body.startswith(METRICS_PREFIX):
+                    try:
+                        payload = json.loads(body[len(METRICS_PREFIX):].decode("utf-8"))
+                        region_metrics.update(payload)
+                    except Exception as e:
+                        print(f"[CLIENT] Failed to parse metrics payload: {e}")
+                    continue
+
                 _, ts_ms = parse_payload(body, password)
                 if ts_ms is None:
                     continue
@@ -371,18 +553,85 @@ async def tcp_client_task(host: str, port: int, delay_ms: int, password: str, st
         await writer.wait_closed()
 
 
-def build_discord_content(snapshot: Dict[str, Optional[str]]) -> str:
-    tcp = snapshot["tcp_ms"]
-    udp = snapshot["udp_ms"]
+def _format_region_section(region_snapshot: Optional[Dict[str, Any]]) -> str:
+    if not region_snapshot or not region_snapshot.get("regions"):
+        return "**AWS latency (server ➜ AWS)**\n```\nPending first sample\n```\n"
+
+    def fmt_ms(value: Optional[float]) -> str:
+        if value is None:
+            return "err"
+        return f"{int(round(value))}ms"
+
+    def fmt_triplet(window: Optional[Dict[str, float]]) -> str:
+        if not window:
+            return "n/a"
+        return f"{int(round(window['avg']))}/{int(round(window['min']))}/{int(round(window['max']))}"
+
+    def fmt_minmax(window: Optional[Dict[str, float]]) -> str:
+        if not window:
+            return "n/a"
+        return f"{int(round(window['min']))}/{int(round(window['max']))}"
+
+    ts_ms = region_snapshot.get("timestamp_ms")
+    if ts_ms:
+        try:
+            updated_dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+            ts = int(updated_dt.timestamp())
+            updated_str = f"<t:{ts}:F> (<t:{ts}:R>)"
+        except Exception:
+            updated_str = str(ts_ms)
+    else:
+        updated_str = "pending"
+
+    header = f"{'Region':<26} {'Latest':>8} {'5m a/m/x':>12} {'30m min/max':>14}"
+    rows: List[str] = []
+    for entry in region_snapshot.get("regions", []):
+        region = entry.get("region", "unknown")
+        latest_tcp = fmt_ms(entry.get("tcp_ms"))
+        window_5m = fmt_triplet(entry.get("tcp_5m"))
+        window_30m = fmt_minmax(entry.get("tcp_30m"))
+        rows.append(
+            f"{region:<26} {latest_tcp:>8} {window_5m:>12} {window_30m:>14}"
+        )
+
+    table = "\n".join([header, "-" * len(header), *rows]) if rows else header
+
+    return (
+        "**AWS latency (server ➜ AWS)**\n"
+        f"```\n{table}\n```\n"
+        f"*Server-updated:* {updated_str}\n"
+    )
+
+
+def build_discord_content(
+    snapshot: Dict[str, Optional[str]],
+    region_snapshot: Optional[Dict[str, Any]],
+) -> str:
+    def fmt_latency(val: Optional[int]) -> str:
+        return f"{val} ms" if val is not None else "n/a"
+
+    def fmt_window(data: Optional[Dict[str, float]]) -> str:
+        if not data:
+            return "n/a"
+        avg = int(round(data["avg"]))
+        return f"{avg} ms (min {int(round(data['min']))}, max {int(round(data['max']))})"
+
+    def fmt_minmax(data: Optional[Dict[str, float]]) -> str:
+        if not data:
+            return "n/a"
+        return f"min {int(round(data['min']))}, max {int(round(data['max']))}"
+
+    def format_block(title: str, latest: Optional[int], win5: Optional[Dict[str, float]], win30: Optional[Dict[str, float]]) -> str:
+        lines = [
+            f"{title}",
+            f"{'Latest':<10}{fmt_latency(latest)}",
+            f"{'5m avg':<10}{fmt_window(win5)}",
+            f"{'30m':<10}{fmt_minmax(win30)}",
+        ]
+        return "```\n" + "\n".join(lines) + "\n```"
+
     updated = snapshot["updated_at"]
-    tcp_2m = snapshot.get("tcp_2m")
-    tcp_5m = snapshot.get("tcp_5m")
-    udp_2m = snapshot.get("udp_2m")
-    udp_5m = snapshot.get("udp_5m")
-    tcp_str = f"{tcp} ms" if tcp is not None else "n/a"
-    udp_str = f"{udp} ms" if udp is not None else "n/a"
     if updated:
-        # Discord timestamp tags render in each user's local timezone
         try:
             updated_dt = datetime.fromisoformat(updated)
             ts = int(updated_dt.timestamp())
@@ -392,34 +641,24 @@ def build_discord_content(snapshot: Dict[str, Optional[str]]) -> str:
     else:
         updated_str = "pending"
 
-    def fmt_window(data: Optional[Dict[str, float]]) -> str:
-        if not data:
-            return "n/a"
-        return (
-            f"avg `{data['avg']:.1f} ms` · "
-            f"min `{int(data['min'])}` · "
-            f"max `{int(data['max'])}`"
-        )
+    tcp_block = format_block("TCP (client ↔ server)", snapshot["tcp_ms"], snapshot.get("tcp_5m"), snapshot.get("tcp_30m"))
+    udp_block = format_block("UDP (client ↔ server)", snapshot["udp_ms"], snapshot.get("udp_5m"), snapshot.get("udp_30m"))
+    region_section = _format_region_section(region_snapshot)
 
     return (
         "**Server Status (ping from FourBolt's place)**\n"
-        f"**TCP**\n"
-        f"• Latest: `{tcp_str}`\n"
-        f"• 2m: {fmt_window(tcp_2m)}\n"
-        f"• 5m: {fmt_window(tcp_5m)}\n"
-        f"**UDP**\n"
-        f"• Latest: `{udp_str}`\n"
-        f"• 2m: {fmt_window(udp_2m)}\n"
-        f"• 5m: {fmt_window(udp_5m)}\n"
+        f"{tcp_block}\n"
+        f"{udp_block}\n"
         f"*Updated:* {updated_str}\n"
+        f"{region_section}"
     )
 
 
 async def discord_status_task(
     stats: RttStats,
+    region_metrics: RegionLatencyState,
     bot: DiscordBotClient,
     interval_seconds: int = 5,
-    message_id_file: Optional[str] = None,
 ):
     if not await bot.initialize():
         print("[DISCORD] Skipping status updates due to failed bot initialization")
@@ -431,7 +670,8 @@ async def discord_status_task(
 
     while True:
         snapshot = stats.snapshot()
-        content = build_discord_content(snapshot)
+        region_snapshot = region_metrics.snapshot()
+        content = build_discord_content(snapshot, region_snapshot)
 
         if not posted_once:
             new_id = await bot.post_message(content)
@@ -440,8 +680,6 @@ async def discord_status_task(
                 bot.message_id = new_id
                 posted_once = True
                 print(f"[DISCORD] Posted status message id={new_id}")
-                if message_id_file:
-                    write_message_id_to_file(message_id_file, new_id)
             else:
                 print("[DISCORD] Failed to post initial status message; retrying...")
             await asyncio.sleep(interval_seconds)
@@ -471,18 +709,22 @@ async def run_client(
     discord_token: Optional[str],
     discord_channel_id: Optional[str],
     discord_message_id: Optional[str],
-    discord_message_id_file: Optional[str],
 ):
     stats = RttStats()
+    region_metrics = RegionLatencyState()
     tasks = [
         udp_client_task(host, udp_port, delay_ms, password, stats),
-        tcp_client_task(host, tcp_port, delay_ms, password, stats),
+        tcp_client_task(host, tcp_port, delay_ms, password, stats, region_metrics),
     ]
 
     if discord_token and discord_channel_id:
         bot = DiscordBotClient(discord_token, discord_channel_id, discord_message_id)
         tasks.append(
-            discord_status_task(stats, bot, message_id_file=discord_message_id_file)
+            discord_status_task(
+                stats,
+                region_metrics,
+                bot,
+            )
         )
     else:
         print("[DISCORD] Skipping status updates (token or channel ID missing)")
@@ -522,7 +764,6 @@ def main():
         discord_token = os.environ.get("HORIZON_STATUS_DISCORD_TOKEN")
         discord_channel_id = os.environ.get("HORIZON_STATUS_CHANNEL_ID")
         discord_message_id = os.environ.get("HORIZON_STATUS_MESSAGE_ID")
-        discord_message_id_file = os.environ.get("HORIZON_STATUS_MESSAGE_ID_FILE")
         if not discord_token:
             print("ERROR: HORIZON_STATUS_DISCORD_TOKEN must be set for Discord updates.")
             sys.exit(1)
@@ -542,7 +783,6 @@ def main():
                 discord_token,
                 discord_channel_id,
                 discord_message_id,
-                discord_message_id_file,
             )
         )
 
