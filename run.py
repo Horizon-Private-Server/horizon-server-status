@@ -28,18 +28,19 @@ USER_AGENT = "HorizonMetricsBot/1.0 (+https://horizon)"
 # Docs: https://docs.aws.amazon.com/ec2/latest/devguide/ec2-endpoints.html
 REGION_ENDPOINTS = {
     # US
-    "us-east-1 (N. Virginia)": "https://ec2.us-east-1.amazonaws.com",
-    "us-east-2 (Ohio)": "https://ec2.us-east-2.amazonaws.com",
-    "us-west-1 (N. California)": "https://ec2.us-west-1.amazonaws.com",
-    "us-west-2 (Oregon)": "https://ec2.us-west-2.amazonaws.com",
+    "N. Virginia": "https://ec2.us-east-1.amazonaws.com",
+    "Ohio": "https://ec2.us-east-2.amazonaws.com",
+    "N. California": "https://ec2.us-west-1.amazonaws.com",
+    "Oregon": "https://ec2.us-west-2.amazonaws.com",
     # Europe
-    "eu-west-1 (Ireland)": "https://ec2.eu-west-1.amazonaws.com",
-    "eu-central-1 (Frankfurt)": "https://ec2.eu-central-1.amazonaws.com",
-    "eu-north-1 (Stockholm)": "https://ec2.eu-north-1.amazonaws.com",
+    "Ireland": "https://ec2.eu-west-1.amazonaws.com",
+    "Frankfurt": "https://ec2.eu-central-1.amazonaws.com",
+    "Stockholm": "https://ec2.eu-north-1.amazonaws.com",
 }
 
 REGION_PING_INTERVAL_SECONDS = 5
 TCP_TIMEOUT_SECONDS = 3
+RECONNECT_DELAY_SECONDS = 3
 METRICS_PREFIX = b"METRICS|"
 
 
@@ -105,6 +106,19 @@ class RttStats:
             "udp_5m": self._window_stats(self.udp_history, now_ts_ms, 5 * 60 * 1000),
             "udp_30m": self._window_minmax(self.udp_history, now_ts_ms, 30 * 60 * 1000),
         }
+
+
+@dataclass
+class ConnectionState:
+    online: bool = False
+    last_reached: Optional[datetime] = None
+
+    def mark_reached(self) -> None:
+        self.last_reached = datetime.now(timezone.utc)
+        self.online = True
+
+    def mark_offline(self) -> None:
+        self.online = False
 
 
 class RegionLatencyState:
@@ -455,10 +469,11 @@ async def run_server(tcp_port: int, udp_port: int, password: str):
 
 
 class UdpClientProtocol(asyncio.DatagramProtocol):
-    def __init__(self, password: str, stats: RttStats):
+    def __init__(self, password: str, stats: RttStats, connection_state: ConnectionState):
         self.password = password
         self.transport = None
         self.stats = stats
+        self.connection_state = connection_state
 
     def connection_made(self, transport):
         self.transport = transport
@@ -472,12 +487,20 @@ class UdpClientProtocol(asyncio.DatagramProtocol):
         rtt_ms = now_ms - ts_ms
         #(f"UDP RTT: {rtt_ms} ms")
         self.stats.update_udp(rtt_ms)
+        self.connection_state.mark_reached()
 
 
-async def udp_client_task(host: str, port: int, delay_ms: int, password: str, stats: RttStats):
+async def udp_client_task(
+    host: str,
+    port: int,
+    delay_ms: int,
+    password: str,
+    stats: RttStats,
+    connection_state: ConnectionState,
+):
     loop = asyncio.get_running_loop()
     transport, _ = await loop.create_datagram_endpoint(
-        lambda: UdpClientProtocol(password, stats),
+        lambda: UdpClientProtocol(password, stats, connection_state),
         remote_addr=(host, port),
     )
 
@@ -497,60 +520,79 @@ async def tcp_client_task(
     password: str,
     stats: RttStats,
     region_metrics: RegionLatencyState,
+    connection_state: ConnectionState,
 ):
-    reader, writer = await asyncio.open_connection(host, port)
-    addr = writer.get_extra_info("peername")
-    print(f"[CLIENT] Connected to TCP server at {addr}")
-
-    async def sender():
+    while True:
+        reader = None
+        writer = None
+        send_task = None
+        recv_task = None
         try:
-            while True:
-                body = build_payload(password)
-                msg_len = len(body)
-                if msg_len > 65535:
-                    raise ValueError("Message too long")
-                header = struct.pack("!H", msg_len)
-                writer.write(header + body)
-                await writer.drain()
-                await asyncio.sleep(delay_ms / 1000.0)
-        except asyncio.CancelledError:
-            pass
+            reader, writer = await asyncio.open_connection(host, port)
+            addr = writer.get_extra_info("peername")
+            print(f"[CLIENT] Connected to TCP server at {addr}")
 
-    async def receiver():
-        try:
-            while True:
-                header = await reader.readexactly(2)
-                (msg_len,) = struct.unpack("!H", header)
-                body = await reader.readexactly(msg_len)
-                if body.startswith(METRICS_PREFIX):
-                    try:
-                        payload = json.loads(body[len(METRICS_PREFIX):].decode("utf-8"))
-                        region_metrics.update(payload)
-                    except Exception as e:
-                        print(f"[CLIENT] Failed to parse metrics payload: {e}")
-                    continue
+            async def sender():
+                while True:
+                    body = build_payload(password)
+                    msg_len = len(body)
+                    if msg_len > 65535:
+                        raise ValueError("Message too long")
+                    header = struct.pack("!H", msg_len)
+                    writer.write(header + body)
+                    await writer.drain()
+                    await asyncio.sleep(delay_ms / 1000.0)
 
-                _, ts_ms = parse_payload(body, password)
-                if ts_ms is None:
-                    continue
-                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-                rtt_ms = now_ms - ts_ms
-                #print(f"TCP RTT: {rtt_ms} ms")
-                stats.update_tcp(rtt_ms)
-        except asyncio.IncompleteReadError:
-            print("[CLIENT] TCP connection closed by server")
-        except asyncio.CancelledError:
-            pass
+            async def receiver():
+                try:
+                    while True:
+                        header = await reader.readexactly(2)
+                        (msg_len,) = struct.unpack("!H", header)
+                        body = await reader.readexactly(msg_len)
+                        if body.startswith(METRICS_PREFIX):
+                            try:
+                                payload = json.loads(body[len(METRICS_PREFIX):].decode("utf-8"))
+                                region_metrics.update(payload)
+                            except Exception as e:
+                                print(f"[CLIENT] Failed to parse metrics payload: {e}")
+                            continue
 
-    send_task = asyncio.create_task(sender())
-    recv_task = asyncio.create_task(receiver())
-    try:
-        await asyncio.gather(send_task, recv_task)
-    finally:
-        send_task.cancel()
-        recv_task.cancel()
-        writer.close()
-        await writer.wait_closed()
+                        _, ts_ms = parse_payload(body, password)
+                        if ts_ms is None:
+                            continue
+                        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+                        rtt_ms = now_ms - ts_ms
+                        #print(f"TCP RTT: {rtt_ms} ms")
+                        stats.update_tcp(rtt_ms)
+                        connection_state.mark_reached()
+                except asyncio.IncompleteReadError:
+                    print("[CLIENT] TCP connection closed by server")
+
+            send_task = asyncio.create_task(sender())
+            recv_task = asyncio.create_task(receiver())
+            done, pending = await asyncio.wait(
+                [send_task, recv_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                exc = task.exception()
+                if exc:
+                    raise exc
+        except Exception as e:
+            print(f"[CLIENT] TCP connection error: {e}")
+        finally:
+            connection_state.mark_offline()
+            if send_task:
+                send_task.cancel()
+            if recv_task:
+                recv_task.cancel()
+            if writer:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
 
 def _format_region_section(region_snapshot: Optional[Dict[str, Any]]) -> str:
@@ -654,9 +696,24 @@ def build_discord_content(
     )
 
 
+def build_offline_content(connection_state: ConnectionState) -> str:
+    updated_ts = int(datetime.now(timezone.utc).timestamp())
+    updated_str = f"<t:{updated_ts}:F> (<t:{updated_ts}:R>)"
+    if connection_state.last_reached:
+        ts = int(connection_state.last_reached.timestamp())
+        last_reached_str = f"<t:{ts}:F>"
+    else:
+        last_reached_str = "unknown"
+    return (
+        f"Server is offline, unreachable. Last reached {last_reached_str}.\n"
+        f"*Updated:* {updated_str}"
+    )
+
+
 async def discord_status_task(
     stats: RttStats,
     region_metrics: RegionLatencyState,
+    connection_state: ConnectionState,
     bot: DiscordBotClient,
     interval_seconds: int = 5,
 ):
@@ -669,9 +726,12 @@ async def discord_status_task(
     edit_failure_logged = False
 
     while True:
-        snapshot = stats.snapshot()
-        region_snapshot = region_metrics.snapshot()
-        content = build_discord_content(snapshot, region_snapshot)
+        if not connection_state.online:
+            content = build_offline_content(connection_state)
+        else:
+            snapshot = stats.snapshot()
+            region_snapshot = region_metrics.snapshot()
+            content = build_discord_content(snapshot, region_snapshot)
 
         if not posted_once:
             new_id = await bot.post_message(content)
@@ -712,9 +772,10 @@ async def run_client(
 ):
     stats = RttStats()
     region_metrics = RegionLatencyState()
+    connection_state = ConnectionState()
     tasks = [
-        udp_client_task(host, udp_port, delay_ms, password, stats),
-        tcp_client_task(host, tcp_port, delay_ms, password, stats, region_metrics),
+        udp_client_task(host, udp_port, delay_ms, password, stats, connection_state),
+        tcp_client_task(host, tcp_port, delay_ms, password, stats, region_metrics, connection_state),
     ]
 
     if discord_token and discord_channel_id:
@@ -723,6 +784,7 @@ async def run_client(
             discord_status_task(
                 stats,
                 region_metrics,
+                connection_state,
                 bot,
             )
         )
