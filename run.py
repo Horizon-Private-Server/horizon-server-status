@@ -595,82 +595,27 @@ async def tcp_client_task(
             await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
 
-def _format_region_section(region_snapshot: Optional[Dict[str, Any]]) -> str:
-    if not region_snapshot or not region_snapshot.get("regions"):
-        return "**AWS latency (server ➜ AWS)**\n```\nPending first sample\n```\n"
-
-    def fmt_ms(value: Optional[float]) -> str:
-        if value is None:
-            return "err"
-        return f"{int(round(value))}ms"
-
-    def fmt_triplet(window: Optional[Dict[str, float]]) -> str:
-        if not window:
-            return "n/a"
-        return f"{int(round(window['avg']))}/{int(round(window['min']))}/{int(round(window['max']))}"
-
-    def fmt_minmax(window: Optional[Dict[str, float]]) -> str:
-        if not window:
-            return "n/a"
-        return f"{int(round(window['min']))}/{int(round(window['max']))}"
-
-    ts_ms = region_snapshot.get("timestamp_ms")
-    if ts_ms:
-        try:
-            updated_dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-            ts = int(updated_dt.timestamp())
-            updated_str = f"<t:{ts}:F> (<t:{ts}:R>)"
-        except Exception:
-            updated_str = str(ts_ms)
-    else:
-        updated_str = "pending"
-
-    header = f"{'Region':<26} {'Latest':>8} {'5m a/m/x':>12} {'30m min/max':>14}"
-    rows: List[str] = []
-    for entry in region_snapshot.get("regions", []):
-        region = entry.get("region", "unknown")
-        latest_tcp = fmt_ms(entry.get("tcp_ms"))
-        window_5m = fmt_triplet(entry.get("tcp_5m"))
-        window_30m = fmt_minmax(entry.get("tcp_30m"))
-        rows.append(
-            f"{region:<26} {latest_tcp:>8} {window_5m:>12} {window_30m:>14}"
-        )
-
-    table = "\n".join([header, "-" * len(header), *rows]) if rows else header
-
-    return (
-        "**AWS latency (server ➜ AWS)**\n"
-        f"```\n{table}\n```\n"
-        f"*Server-updated:* {updated_str}\n"
-    )
-
-
 def build_discord_content(
     snapshot: Dict[str, Optional[str]],
     region_snapshot: Optional[Dict[str, Any]],
 ) -> str:
     def fmt_latency(val: Optional[int]) -> str:
-        return f"{val} ms" if val is not None else "n/a"
+        return f"{val}ms" if val is not None else "n/a"
 
-    def fmt_window(data: Optional[Dict[str, float]]) -> str:
+    def fmt_triplet(data: Optional[Dict[str, float]]) -> str:
         if not data:
             return "n/a"
-        avg = int(round(data["avg"]))
-        return f"{avg} ms (min {int(round(data['min']))}, max {int(round(data['max']))})"
+        return f"{int(round(data['avg']))}/{int(round(data['min']))}/{int(round(data['max']))}"
 
     def fmt_minmax(data: Optional[Dict[str, float]]) -> str:
         if not data:
             return "n/a"
-        return f"min {int(round(data['min']))}, max {int(round(data['max']))}"
+        return f"{int(round(data['min']))}/{int(round(data['max']))}"
 
-    def format_block(title: str, latest: Optional[int], win5: Optional[Dict[str, float]], win30: Optional[Dict[str, float]]) -> str:
-        lines = [
-            f"{title}",
-            f"{'Latest':<10}{fmt_latency(latest)}",
-            f"{'5m avg':<10}{fmt_window(win5)}",
-            f"{'30m':<10}{fmt_minmax(win30)}",
-        ]
-        return "```\n" + "\n".join(lines) + "\n```"
+    def fmt_ms(value: Optional[float]) -> str:
+        if value is None:
+            return "err"
+        return f"{int(round(value))}ms"
 
     updated = snapshot["updated_at"]
     if updated:
@@ -683,16 +628,29 @@ def build_discord_content(
     else:
         updated_str = "pending"
 
-    tcp_block = format_block("TCP (client ↔ server)", snapshot["tcp_ms"], snapshot.get("tcp_5m"), snapshot.get("tcp_30m"))
-    udp_block = format_block("UDP (client ↔ server)", snapshot["udp_ms"], snapshot.get("udp_5m"), snapshot.get("udp_30m"))
-    region_section = _format_region_section(region_snapshot)
+    table_header = f"{'Path':<16} {'Latest':>8} {'5m a/m/x':>12} {'30m min/max':>14}"
+    table_rows = [
+        f"{'TCP':<16} {fmt_latency(snapshot['tcp_ms']):>8} {fmt_triplet(snapshot.get('tcp_5m')):>12} {fmt_minmax(snapshot.get('tcp_30m')):>14}",
+        f"{'UDP':<16} {fmt_latency(snapshot['udp_ms']):>8} {fmt_triplet(snapshot.get('udp_5m')):>12} {fmt_minmax(snapshot.get('udp_30m')):>14}",
+    ]
+
+    if region_snapshot and region_snapshot.get("regions"):
+        for entry in region_snapshot.get("regions", []):
+            region = entry.get("region", "unknown")
+            latest_tcp = fmt_ms(entry.get("tcp_ms"))
+            window_5m = fmt_triplet(entry.get("tcp_5m"))
+            window_30m = fmt_minmax(entry.get("tcp_30m"))
+            table_rows.append(
+                f"{region:<16} {latest_tcp:>8} {window_5m:>12} {window_30m:>14}"
+            )
+    else:
+        table_rows.append(f"{'AWS regions':<16} {'pending':>8} {'n/a':>12} {'n/a':>14}")
+
+    latency_table = "\n".join([table_header, "-" * len(table_header), *table_rows])
 
     return (
-        "**Server Status (ping from FourBolt's place)**\n"
-        f"{tcp_block}\n"
-        f"{udp_block}\n"
+        f"```\n{latency_table}\n```\n"
         f"*Updated:* {updated_str}\n"
-        f"{region_section}"
     )
 
 
