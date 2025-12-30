@@ -40,7 +40,7 @@ echo "  STATE_DIR  = ${STATE_DIR}"
 # Ensure old container is removed before starting a new one
 docker rm -f horizon-status-client >/dev/null 2>&1 || true
 
-docker run --restart unless-stopped --rm -d --name horizon-status-client \
+docker run --restart unless-stopped -d --name horizon-status-client \
   --network host \
   -v "${STATE_DIR}:/state" \
   -e "HORIZON_STATUS_DISCORD_TOKEN=${DISCORD_TOKEN}" \
